@@ -1,0 +1,54 @@
+# ===========================================================
+# application-prod.yml — Production environment overrides
+# ===========================================================
+# Conservative settings, tighter logging, no experimental flags
+# ===========================================================
+
+logging:
+  level:
+    root: WARN
+    com.acme.syncservice: INFO
+    org.springframework: WARN
+    org.springframework.data.mongodb: WARN
+
+spring:
+  mongodb:
+    pool:
+      max-size: 50
+      min-size: 10
+      # Slightly more aggressive idle timeout in prod
+      max-connection-idle-time: 60000
+
+server:
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 50
+    max-connections: 10000
+    accept-count: 100
+
+features:
+  new-sync-algorithm:
+    enabled: true
+  experimental-endpoints:
+    enabled: false           # Never on in prod
+
+sync:
+  retry:
+    max-attempts: 3
+    initial-delay-ms: 1000
+    max-delay-ms: 30000
+  timeout:
+    mongo-query-ms: 5000
+    external-api-ms: 10000
+  circuit-breaker:
+    failure-rate-threshold: 50
+    wait-duration-in-open-state: 30s
+    sliding-window-size: 100
+
+# More detailed health check filtering in prod (don't leak internal info)
+management:
+  endpoint:
+    health:
+      show-details: never
+      show-components: never

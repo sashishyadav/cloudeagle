@@ -1,0 +1,36 @@
+# ===========================================================
+# application-staging.yml — Staging environment overrides
+# ===========================================================
+# Mirror production as closely as possible — same settings,
+# same scale characteristics, same feature flags
+# ===========================================================
+
+logging:
+  level:
+    com.acme.syncservice: INFO
+    org.springframework.data.mongodb: WARN
+
+spring:
+  mongodb:
+    pool:
+      max-size: 50
+      min-size: 10
+
+server:
+  tomcat:
+    threads:
+      max: 200
+
+features:
+  new-sync-algorithm:
+    enabled: true            # Match prod feature flags
+  experimental-endpoints:
+    enabled: false
+
+sync:
+  retry:
+    max-attempts: 3
+    initial-delay-ms: 1000
+  timeout:
+    mongo-query-ms: 5000
+    external-api-ms: 10000

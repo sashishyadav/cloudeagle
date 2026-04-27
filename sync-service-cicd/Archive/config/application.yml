@@ -1,0 +1,63 @@
+# ===========================================================
+# application.yml — shared defaults (all environments)
+# ===========================================================
+spring:
+  application:
+    name: sync-service
+
+  # Graceful shutdown: required for zero-downtime blue/green
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  # MongoDB defaults (connection URI injected via MONGO_URI env var)
+  data:
+    mongodb:
+      uri: ${MONGO_URI}
+      auto-index-creation: false
+
+  # Connection pool tuning
+  mongodb:
+    pool:
+      max-size: 50
+      min-size: 10
+      max-wait-time: 5000
+      max-connection-life-time: 120000
+
+server:
+  port: 8080
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    connection-timeout: 20s
+    max-connections: 10000
+
+# Separate liveness vs readiness for blue/green — critical
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: when-authorized
+  health:
+    livenessState:
+      enabled: true
+    readinessState:
+      enabled: true
+  metrics:
+    export:
+      stackdriver:
+        project-id: ${GCP_PROJECT_ID}
+        enabled: true
+
+logging:
+  pattern:
+    console: '%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n'
+  level:
+    root: INFO
+    com.acme.syncservice: INFO

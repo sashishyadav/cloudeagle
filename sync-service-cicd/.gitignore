@@ -1,0 +1,41 @@
+# Build outputs
+target/
+build/
+out/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.project
+.classpath
+.settings/
+
+# Maven / Gradle
+.mvn/wrapper/maven-wrapper.jar
+!.mvn/wrapper/maven-wrapper.properties
+.gradle/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Secrets — in case someone fat-fingers
+*.pem
+*.key
+secrets.yml
+.env
+.env.local
+
+# Local config overrides
+application-local.yml
+
+# Jenkins local artifacts
+.jenkins-stash/

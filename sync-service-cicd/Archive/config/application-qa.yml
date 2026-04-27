@@ -1,0 +1,38 @@
+# ===========================================================
+# application-qa.yml — QA environment overrides
+# ===========================================================
+# Verbose logging, aggressive feature flags, shorter timeouts
+# for faster test feedback
+# ===========================================================
+
+logging:
+  level:
+    com.acme.syncservice: DEBUG
+    org.springframework.data.mongodb: DEBUG
+    org.mongodb.driver: INFO
+
+spring:
+  mongodb:
+    pool:
+      max-size: 20           # Lower — QA has smaller instances
+      min-size: 5
+
+server:
+  tomcat:
+    threads:
+      max: 50                # Lower than prod
+
+features:
+  new-sync-algorithm:
+    enabled: true            # Always on in QA for testing
+  experimental-endpoints:
+    enabled: true
+
+# Shorter timeouts to surface issues faster
+sync:
+  retry:
+    max-attempts: 2
+    initial-delay-ms: 500
+  timeout:
+    mongo-query-ms: 3000
+    external-api-ms: 5000

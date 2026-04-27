@@ -1,0 +1,461 @@
+// =============================================================
+// Jenkinsfile — sync-service
+// -------------------------------------------------------------
+// Spring Boot · MongoDB · GCP VMs
+// Environments: qa (rolling) | staging (blue/green) | prod (blue/green + manual gate)
+// =============================================================
+
+pipeline {
+    agent any
+
+    tools {
+        jdk   'JDK-17'
+        maven 'Maven-3.9'
+    }
+
+    environment {
+        SERVICE_NAME   = 'sync-service'
+        GCP_PROJECT    = 'acme-sync-service'
+        GCP_REGION     = 'us-central1'
+        REGISTRY       = "us-central1-docker.pkg.dev/${GCP_PROJECT}/sync-service"
+        GIT_SHA        = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        IMAGE_TAG      = "${GIT_SHA}-${BUILD_NUMBER}"
+        FULL_IMAGE     = "${REGISTRY}/${SERVICE_NAME}:${IMAGE_TAG}"
+        SONAR_PROJECT  = 'sync-service'
+        SLACK_CHANNEL  = '#deployments'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    parameters {
+        choice(
+            name: 'MANUAL_ENV',
+            choices: ['', 'qa', 'staging', 'prod'],
+            description: 'Force deploy to a specific env (leave empty for auto-detect from branch)'
+        )
+        string(
+            name: 'ROLLBACK_TAG',
+            defaultValue: '',
+            description: 'Image tag to roll back to (leave empty for normal deploy)'
+        )
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.BRANCH_NAME = env.BRANCH_NAME ?: sh(
+                        script: 'git rev-parse --abbrev-ref HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    env.PREV_IMAGE  = getPreviousImageTag()
+                    env.ENVIRONMENT = resolveEnvironment()
+                    env.IS_PR       = env.CHANGE_ID ? 'true' : 'false'
+
+                    echo "Branch      : ${env.BRANCH_NAME}"
+                    echo "Environment : ${env.ENVIRONMENT ?: '(none — CI only)'}"
+                    echo "Is PR       : ${env.IS_PR}"
+                    echo "Image tag   : ${IMAGE_TAG}"
+                    echo "Prev image  : ${env.PREV_IMAGE ?: '(none)'}"
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Compile') {
+            steps { sh 'mvn clean compile -q' }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Unit Tests') {
+            steps { sh 'mvn test -q' }
+            post {
+                always {
+                    junit '**/target/surefire-reports/*.xml'
+                    jacoco(
+                        execPattern: '**/target/jacoco.exec',
+                        classPattern: '**/target/classes',
+                        sourcePattern: '**/src/main/java',
+                        minimumInstructionCoverage: '70'
+                    )
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Integration Tests') {
+            steps { sh 'mvn verify -P integration-tests -q' }
+            post {
+                always { junit '**/target/failsafe-reports/*.xml' }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        mvn sonar:sonar \
+                          -Dsonar.projectKey=${SONAR_PROJECT} \
+                          -Dsonar.qualitygate.wait=true \
+                          -q
+                    """
+                }
+            }
+        }
+
+        // ─── CI-only stages end here for PRs ──────────────────────
+
+        // ─────────────────────────────────────────────────────────
+        stage('Build Docker Image') {
+            when { expression { env.IS_PR == 'false' && env.ENVIRONMENT } }
+            steps {
+                sh """
+                    mvn package -DskipTests -q
+                    docker build \
+                      --build-arg JAR_FILE=target/${SERVICE_NAME}-*.jar \
+                      --build-arg PROFILE=${env.ENVIRONMENT} \
+                      -t ${FULL_IMAGE} \
+                      -t ${REGISTRY}/${SERVICE_NAME}:latest-${env.ENVIRONMENT} \
+                      .
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Push Image') {
+            when { expression { env.IS_PR == 'false' && env.ENVIRONMENT } }
+            steps {
+                withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY')]) {
+                    sh """
+                        gcloud auth activate-service-account --key-file="\$SA_KEY"
+                        gcloud auth configure-docker ${GCP_REGION}-docker.pkg.dev --quiet
+                        docker push ${FULL_IMAGE}
+                        docker push ${REGISTRY}/${SERVICE_NAME}:latest-${env.ENVIRONMENT}
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Deploy') {
+            when { expression { env.IS_PR == 'false' && env.ENVIRONMENT } }
+            steps {
+                script {
+                    if (params.ROLLBACK_TAG?.trim()) {
+                        echo "⚠️  ROLLBACK mode — target tag: ${params.ROLLBACK_TAG}"
+                        deployRollback(env.ENVIRONMENT, params.ROLLBACK_TAG)
+                    } else if (env.ENVIRONMENT == 'prod') {
+                        notifySlack(
+                            "⏳ *Prod deployment ready* — awaiting approval\n" +
+                            "Service : ${SERVICE_NAME}\n" +
+                            "Image   : `${IMAGE_TAG}`\n" +
+                            "Approve : ${env.BUILD_URL}input"
+                        )
+                        timeout(time: 30, unit: 'MINUTES') {
+                            input(
+                                message: "Deploy ${IMAGE_TAG} to PRODUCTION?",
+                                ok: 'Deploy to Prod',
+                                submitterParameter: 'APPROVER'
+                            )
+                        }
+                        echo "✅ Prod deploy approved by: ${env.APPROVER}"
+                        blueGreenDeploy(env.ENVIRONMENT)
+                    } else if (env.ENVIRONMENT == 'staging') {
+                        blueGreenDeploy(env.ENVIRONMENT)
+                    } else {
+                        rollingDeploy(env.ENVIRONMENT)
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Smoke Tests') {
+            when { expression { env.IS_PR == 'false' && env.ENVIRONMENT } }
+            steps {
+                script {
+                    def endpoint = getEndpoint(env.ENVIRONMENT)
+                    sh """
+                        set -e
+                        echo "Smoke testing ${endpoint}..."
+                        for i in \$(seq 1 10); do
+                            STATUS=\$(curl -s -o /dev/null -w '%{http_code}' \
+                                ${endpoint}/actuator/health)
+                            echo "Attempt \$i — HTTP \$STATUS"
+                            if [ "\$STATUS" = "200" ]; then
+                                echo "✅ Smoke test passed"
+                                exit 0
+                            fi
+                            sleep 6
+                        done
+                        echo "❌ Smoke test failed after 10 attempts"
+                        exit 1
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('Finalize Blue/Green') {
+            when {
+                expression {
+                    env.IS_PR == 'false' &&
+                    (env.ENVIRONMENT == 'staging' || env.ENVIRONMENT == 'prod')
+                }
+            }
+            steps {
+                script {
+                    echo "🟢 New version live — keeping old color warm for 10 min (rollback window)..."
+                    sleep(time: 10, unit: 'MINUTES')
+                    teardownOldColor(env.ENVIRONMENT)
+                    echo "🧹 Old color decommissioned"
+                }
+            }
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    post {
+        success {
+            script {
+                if (env.IS_PR == 'false' && env.ENVIRONMENT) {
+                    notifySlack(
+                        "✅ *${SERVICE_NAME}* deployed to *${env.ENVIRONMENT}*\n" +
+                        "Image    : `${IMAGE_TAG}`\n" +
+                        "Approver : ${env.APPROVER ?: 'auto-deploy'}"
+                    )
+                }
+            }
+        }
+        failure {
+            script {
+                if (env.IS_PR == 'false' && env.ENVIRONMENT && env.PREV_IMAGE) {
+                    try {
+                        echo "❌ Deploy failed — initiating automatic rollback"
+                        deployRollback(env.ENVIRONMENT, env.PREV_IMAGE)
+                        notifySlack(
+                            "🔴 *${SERVICE_NAME}* deploy FAILED on *${env.ENVIRONMENT}* — " +
+                            "auto-rolled back to `${env.PREV_IMAGE}`\n" +
+                            "Build: ${env.BUILD_URL}"
+                        )
+                    } catch (rollbackEx) {
+                        notifySlack(
+                            "🚨 *${SERVICE_NAME}* deploy FAILED AND rollback also failed " +
+                            "on *${env.ENVIRONMENT}*\n" +
+                            "Manual intervention required!\n" +
+                            "Build: ${env.BUILD_URL}"
+                        )
+                    }
+                } else {
+                    notifySlack(
+                        "🔴 *${SERVICE_NAME}* build failed on `${env.BRANCH_NAME}`\n" +
+                        "Build: ${env.BUILD_URL}"
+                    )
+                }
+            }
+        }
+        always { cleanWs() }
+    }
+}
+
+// =============================================================================
+// Helper functions
+// =============================================================================
+
+def resolveEnvironment() {
+    if (params.MANUAL_ENV?.trim()) return params.MANUAL_ENV
+    def branch = env.BRANCH_NAME
+    if (branch == 'develop')          return 'qa'
+    if (branch.startsWith('release/')) return 'staging'
+    if (branch == 'main')             return 'prod'
+    return ''
+}
+
+def getPreviousImageTag() {
+    try {
+        def targetEnv = resolveEnvironment()
+        if (!targetEnv) return ''
+        return sh(
+            script: """
+                gcloud compute instance-templates list \
+                  --project=${GCP_PROJECT} \
+                  --filter="name~${SERVICE_NAME}-${targetEnv}" \
+                  --sort-by=~creationTimestamp \
+                  --limit=1 \
+                  --format='value(name)' 2>/dev/null | \
+                  sed 's/.*-//' || echo ''
+            """,
+            returnStdout: true
+        ).trim()
+    } catch (e) {
+        return ''
+    }
+}
+
+def blueGreenDeploy(String environment) {
+    withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY')]) {
+        sh """
+            set -e
+            gcloud auth activate-service-account --key-file="\$SA_KEY"
+
+            ACTIVE=\$(gcloud compute backend-services describe \
+                       ${SERVICE_NAME}-${environment}-lb \
+                       --global --project=${GCP_PROJECT} \
+                       --format='value(backends[0].group)' | \
+                       grep -oE '(blue|green)' | head -1 || echo 'blue')
+            IDLE=\$([ "\$ACTIVE" = "blue" ] && echo "green" || echo "blue")
+
+            echo "Active color : \$ACTIVE"
+            echo "Deploying to : \$IDLE"
+
+            gcloud compute instance-templates create \
+              ${SERVICE_NAME}-${environment}-\$IDLE-${IMAGE_TAG} \
+              --project=${GCP_PROJECT} \
+              --source-instance-template=${SERVICE_NAME}-${environment}-template-base \
+              --metadata=IMAGE_TAG=${IMAGE_TAG},ENVIRONMENT=${environment} \
+              --quiet
+
+            gcloud compute instance-groups managed set-instance-template \
+              ${SERVICE_NAME}-${environment}-\$IDLE \
+              --template=${SERVICE_NAME}-${environment}-\$IDLE-${IMAGE_TAG} \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT} \
+              --quiet
+
+            gcloud compute instance-groups managed rolling-action replace \
+              ${SERVICE_NAME}-${environment}-\$IDLE \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT} \
+              --max-unavailable=0 \
+              --max-surge=2 \
+              --quiet
+
+            gcloud compute instance-groups managed wait-until \
+              ${SERVICE_NAME}-${environment}-\$IDLE \
+              --version-target-reached \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT}
+
+            echo \$IDLE > /tmp/new_color_${environment}
+        """
+    }
+}
+
+def teardownOldColor(String environment) {
+    withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY')]) {
+        sh """
+            set -e
+            gcloud auth activate-service-account --key-file="\$SA_KEY"
+
+            NEW_COLOR=\$(cat /tmp/new_color_${environment})
+            OLD_COLOR=\$([ "\$NEW_COLOR" = "blue" ] && echo "green" || echo "blue")
+
+            echo "Flipping LB : \$OLD_COLOR ──► \$NEW_COLOR"
+
+            gcloud compute backend-services update ${SERVICE_NAME}-${environment}-lb \
+              --global --project=${GCP_PROJECT} --no-backends --quiet
+
+            gcloud compute backend-services add-backend ${SERVICE_NAME}-${environment}-lb \
+              --global \
+              --instance-group=${SERVICE_NAME}-${environment}-\$NEW_COLOR \
+              --instance-group-region=${GCP_REGION} \
+              --project=${GCP_PROJECT} --quiet
+
+            echo "Scaling down old color: \$OLD_COLOR"
+            gcloud compute instance-groups managed resize \
+              ${SERVICE_NAME}-${environment}-\$OLD_COLOR \
+              --size=0 \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT} --quiet
+        """
+    }
+}
+
+def rollingDeploy(String environment) {
+    withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY')]) {
+        sh """
+            set -e
+            gcloud auth activate-service-account --key-file="\$SA_KEY"
+
+            gcloud compute instance-templates create \
+              ${SERVICE_NAME}-${environment}-${IMAGE_TAG} \
+              --project=${GCP_PROJECT} \
+              --source-instance-template=${SERVICE_NAME}-${environment}-template-base \
+              --metadata=IMAGE_TAG=${IMAGE_TAG},ENVIRONMENT=${environment} \
+              --quiet
+
+            gcloud compute instance-groups managed rolling-action start-update \
+              ${SERVICE_NAME}-${environment} \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT} \
+              --version=template=${SERVICE_NAME}-${environment}-${IMAGE_TAG} \
+              --max-unavailable=1 \
+              --max-surge=1 \
+              --quiet
+
+            gcloud compute instance-groups managed wait-until \
+              ${SERVICE_NAME}-${environment} \
+              --version-target-reached \
+              --region=${GCP_REGION} \
+              --project=${GCP_PROJECT}
+        """
+    }
+}
+
+def deployRollback(String environment, String targetTag) {
+    echo "🔄 Rolling back ${environment} to tag: ${targetTag}"
+    if (environment == 'staging' || environment == 'prod') {
+        withCredentials([file(credentialsId: 'gcp-sa-key', variable: 'SA_KEY')]) {
+            sh """
+                set -e
+                gcloud auth activate-service-account --key-file="\$SA_KEY"
+
+                CURRENT=\$(cat /tmp/new_color_${environment} 2>/dev/null || echo 'green')
+                PREV=\$([ "\$CURRENT" = "blue" ] && echo "green" || echo "blue")
+                echo "Flipping LB back: \$CURRENT ──► \$PREV"
+
+                gcloud compute backend-services update ${SERVICE_NAME}-${environment}-lb \
+                  --global --project=${GCP_PROJECT} --no-backends --quiet
+
+                gcloud compute backend-services add-backend ${SERVICE_NAME}-${environment}-lb \
+                  --global \
+                  --instance-group=${SERVICE_NAME}-${environment}-\$PREV \
+                  --instance-group-region=${GCP_REGION} \
+                  --project=${GCP_PROJECT} --quiet
+            """
+        }
+    } else {
+        rollingDeploy(environment)
+    }
+}
+
+def getEndpoint(String environment) {
+    def urls = [
+        qa:      'http://sync-service-qa.internal:8080',
+        staging: 'http://sync-service-staging.internal:8080',
+        prod:    'http://sync-service-prod.internal:8080'
+    ]
+    return urls[environment] ?: 'http://localhost:8080'
+}
+
+def notifySlack(String message) {
+    withCredentials([string(credentialsId: 'slack-webhook-url', variable: 'SLACK_URL')]) {
+        sh """
+            curl -s -X POST "\$SLACK_URL" \
+              -H 'Content-Type: application/json' \
+              -d '{"channel":"${SLACK_CHANNEL}","text":"${message.replaceAll("'", "\\\\'").replaceAll("\"", "\\\\\"")}"}' \
+              || true
+        """
+    }
+}

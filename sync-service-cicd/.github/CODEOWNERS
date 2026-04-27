@@ -1,0 +1,16 @@
+# GitHub CODEOWNERS — enforces review requirements for sync-service
+# Learn more: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default: backend team reviews all changes
+*                           @acme/backend-team
+
+# Pipeline changes require DevOps sign-off
+/jenkins/                   @acme/devops-team @acme/backend-team
+/scripts/                   @acme/devops-team @acme/backend-team
+/Dockerfile                 @acme/devops-team @acme/backend-team
+
+# Config changes for prod require senior approval
+/config/application-prod.yml @acme/backend-leads @acme/devops-team
+
+# Design docs: any reviewer
+/docs/                      @acme/backend-team
